@@ -12,6 +12,8 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/bramvdbogaerde/go-scp"
+
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"gitlab.com/NebulousLabs/ob1-scanner/scanner"
@@ -32,10 +34,10 @@ type ScanConfig struct {
 }
 
 type UpgradeConfig struct {
-	timeout      string
+	sshuser      string
+	sshpass      string
 	firmwarePath string
 	host         string
-	json         bool
 }
 
 var FlagJSON bool
@@ -49,6 +51,9 @@ type JSONMachines struct {
 // ScanConf is a config for scan
 var ScanConf ScanConfig
 
+// UpgradeConf is a config for upgrade
+var UpgradeConf UpgradeConfig
+
 var rootCmd = &cobra.Command{
 	Use:   "ob1-scanner",
 	Short: "ob1-scanner is a quick Obelisk scanner tool",
@@ -60,7 +65,7 @@ var versionCmd = &cobra.Command{
 	Short: "Print the version of ob1-scanner",
 	Long:  "Prints the current binary version of ob1-scanner you are using.",
 	Run: func(cmd *cobra.Command, _ []string) {
-		logrus.Infof("ob1-scanner Version 0.0.1 %s / %s\n", runtime.GOOS, runtime.GOARCH)
+		logrus.Infof("ob1-scanner Version 0.0.3 %s / %s\n", runtime.GOOS, runtime.GOARCH)
 	},
 }
 
@@ -90,6 +95,12 @@ func init() {
 	rootCmd.AddCommand(scanCmd)
 	rootCmd.AddCommand(mdnsCmd)
 	rootCmd.AddCommand(upgradeCmd)
+	// Upgrade config
+	upgradeCmd.PersistentFlags().StringVarP(&UpgradeConf.host, "host", "i", "", "set host")
+	upgradeCmd.PersistentFlags().StringVarP(&UpgradeConf.firmwarePath, "firmware", "f", "", "firmware path")
+	upgradeCmd.PersistentFlags().StringVarP(&UpgradeConf.sshuser, "user", "u", "root", "ssh user")
+	upgradeCmd.PersistentFlags().StringVarP(&UpgradeConf.sshpass, "password", "p", "obelisk", "ssh password")
+	// scan conf
 	scanCmd.PersistentFlags().StringVarP(&ScanConf.timeout, "timeout", "t", "2s", "timeout for port checks and RPC calls")
 	// Figure out subnet
 	var ipString string
@@ -122,51 +133,88 @@ func startDaemonCmd(cmd *cobra.Command, _ []string) {
 }
 
 func upgradeHandler() {
-	cmd := os.Args[1]
-	hosts := os.Args[2:]
-
-	results := make(chan string, 10)
-	timeout := time.After(10 * time.Second)
-
-	port := os.Getenv("PORT")
-	if len(port) == 0 {
-		port = "22"
+	if FlagJSON {
+		logrus.SetFormatter(&logrus.JSONFormatter{})
+	}
+	cmd := []string{
+		"mkdir -p /tmp/upgrade",
+		"cd /tmp/upgrade && gunzip firmware.tar.gz && tar -xf firmware.tar && rm firmware.tar",
 	}
 
+	port := "22"
+	logrus.Infof("Setting up SSH info for Obelisk with IP %s", UpgradeConf.host)
 	config := &ssh.ClientConfig{
-		User: "root",
+		User:            UpgradeConf.sshuser,
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 		Auth: []ssh.AuthMethod{
-			ssh.Password("obelisk"),
+			ssh.Password(UpgradeConf.sshpass),
 		},
 	}
 
-	for _, hostname := range hosts {
-		go func(hostname string, port string) {
-			results <- executeCmd(cmd, hostname, port, config)
-		}(hostname, port)
+	// mkdir
+	logrus.Info("Creating upgrade directory...")
+	executeCmd(cmd[0], UpgradeConf.host, port, config)
+	// scp firmware
+	logrus.Info("SCPing firmware to upgrade directory...")
+	err := moveFile(UpgradeConf.firmwarePath, "/tmp/upgrade/firmware.tar.gz", UpgradeConf.host, port, config)
+	if err != nil {
+		logrus.Error("Error moving file", err)
+		return
 	}
-
-	for i := 0; i < len(hosts); i++ {
-		select {
-		case res := <-results:
-			fmt.Print(res)
-		case <-timeout:
-			fmt.Println("Timed out!")
-			return
-		}
-	}
+	// gunzip and tar
+	logrus.Info("Gunzip and untar'ing upgrade files...")
+	executeCmd(cmd[1], UpgradeConf.host, port, config)
+	logrus.Infof("Firmware transfer complete for Obelisk with IP %s... machine should reboot momentarily.", UpgradeConf.host)
+	return
 }
 
-func executeCmd(command, hostname string, port string, config *ssh.ClientConfig) string {
-	conn, _ := ssh.Dial("tcp", fmt.Sprintf("%s:%s", hostname, port), config)
-	session, _ := conn.NewSession()
+func moveFile(fromPath, toPath, hostname, port string, config *ssh.ClientConfig) error {
+	client := scp.NewClient(fmt.Sprintf("%s:%s", hostname, port), config)
+	defer client.Close()
+	err := client.Connect()
+	if err != nil {
+		logrus.Debug("error connecting to scp", err)
+		return err
+	}
+	f, err := os.Open(fromPath)
+	if err != nil {
+		logrus.Debug("error opening file", err)
+		return err
+	}
+	defer f.Close()
+	err = client.CopyFile(f, toPath, "0755")
+	if err != nil {
+		if err.Error() == "Process exited with status 1" {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func executeCmd(cmd string, hostname string, port string, config *ssh.ClientConfig) string {
+	conn, err := ssh.Dial("tcp", fmt.Sprintf("%s:%s", hostname, port), config)
+	defer conn.Close()
+	if err != nil {
+		logrus.Info("Failed to dial", err)
+	}
+
+	var stdoutBuffer bytes.Buffer
+	var stderrBuffer bytes.Buffer
+	session, err := conn.NewSession()
+	session.Stdout = &stdoutBuffer
+	session.Stderr = &stderrBuffer
+	if err != nil {
+		logrus.Error("Failed to create session", err)
+	}
 	defer session.Close()
-
-	var stdoutBuf bytes.Buffer
-	session.Stdout = &stdoutBuf
-	session.Run(command)
-
-	return fmt.Sprintf("%s -> %s", hostname, stdoutBuf.String())
+	err = session.Run(cmd)
+	if err != nil {
+		logrus.Errorf("cmd run error: %s | %s", err, stderrBuffer.String())
+		return ""
+	}
+	response := stdoutBuffer.String()
+	return response
 }
 
 func scanHandler() {

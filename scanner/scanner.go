@@ -32,9 +32,10 @@ const (
 
 // Obelisk defines the fields for a found unit.
 type Obelisk struct {
-	IP    net.IP `json:"ip"`
-	Model string `json:"model"`
-	MAC   string `json:"mac"`
+	IP       net.IP `json:"ip"`
+	Model    string `json:"model"`
+	MAC      string `json:"mac"`
+	Firmware string `json:"firmwareVersion"`
 }
 
 // ScanJob is a single job for the Prediction Process
@@ -49,6 +50,7 @@ type APIResponseInfo struct {
 	IP         string `json:"ipAddress"`
 	Model      string `json:"model"`
 	Vendor     string `json:"vendor"`
+	Firmware   string `json:"firmwareVersion,omitempty"`
 }
 
 // SubnetFromInterface finds the first IPv4 address that is non-loopback. This
@@ -201,7 +203,7 @@ func identify(ip net.IP, timeout time.Duration) (*Obelisk, error) {
 		endpoint := fmt.Sprintf("http://%s/api/info", ip)
 		resp, err := http.Get(endpoint)
 		if err != nil {
-			return nil, err
+			return nil, nil
 		}
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
@@ -210,12 +212,13 @@ func identify(ip net.IP, timeout time.Duration) (*Obelisk, error) {
 		var info APIResponseInfo
 		err = json.Unmarshal(body, &info)
 		if err != nil {
-			return nil, fmt.Errorf("%s: %s", errUnmarshal, err)
+			return nil, nil
 		}
 		o := &Obelisk{
-			IP:    ip,
-			MAC:   info.MacAddress,
-			Model: info.Model,
+			IP:       ip,
+			MAC:      info.MacAddress,
+			Model:    info.Model,
+			Firmware: info.Firmware,
 		}
 		return o, nil
 	}
